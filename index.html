@@ -1,0 +1,330 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Detroit ZIP Map — Vacancy / Crime / Income / Education</title>
+
+  <!-- Leaflet -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+  <!-- Turf.js for geospatial joins & aggregation -->
+  <script src="https://cdn.jsdelivr.net/npm/@turf/turf@6/turf.min.js"></script>
+
+  <style>
+    html,body,#map { height: 100%; margin: 0; padding: 0; font-family: Arial, Helvetica, sans-serif; }
+    #map { position: absolute; top: 0; bottom: 0; left: 300px; right: 0; }
+    #sidebar { position: absolute; left: 0; top: 0; bottom: 0; width: 300px; overflow:auto; background:#fff; border-right:1px solid #ddd; padding:16px; }
+    label { display:block; margin-top:12px; font-weight:600; }
+    .small { font-size:0.9em; color:#555; }
+    .legend { background:#fff; padding:8px; border-radius:6px; box-shadow:0 1px 4px rgba(0,0,0,.15); }
+  </style>
+</head>
+<body>
+  <div id="sidebar">
+    <h3>Detroit ZIP Map</h3>
+    <p class="small">Filter by vacancy, crime rate, income and education. Data sources: Detroit Open Data, Data Driven Detroit, Census ACS.</p>
+
+    <label>Metric to color by</label>
+    <select id="metric">
+      <option value="vacancy_pct">Vacancy %</option>
+      <option value="crime_rate_per10k">Crime rate (per 10k)</option>
+      <option value="median_household_income">Median household income</option>
+      <option value="pct_bachelors">% Bachelor’s or higher</option>
+    </select>
+
+    <label>Vacancy % (min)</label>
+    <input id="vacancy_min" type="range" min="0" max="100" value="0" />
+    <div id="vacancy_min_val">0%</div>
+
+    <label>Crime rate per 10k (max)</label>
+    <input id="crime_max" type="range" min="0" max="1000" value="1000" />
+    <div id="crime_max_val">1000</div>
+
+    <label>Income (min)</label>
+    <input id="income_min" type="range" min="0" max="150000" step="1000" value="0" />
+    <div id="income_min_val">$0</div>
+
+    <button id="apply">Apply filters</button>
+
+    <hr/>
+    <div id="info">Loading data...</div>
+
+    <hr/>
+    <div class="small">
+      Notes:<br/>
+      • For accuracy, replace example endpoints with your preferred local copies for production.<br/>
+      • Large datasets may cause slow initial load; consider server-side pre-aggregation.
+    </div>
+  </div>
+
+  <div id="map"></div>
+
+<script>
+// ----------------- CONFIG: update these if you want different endpoints -----------------
+const CENSUS_API_KEY = 'REPLACE_WITH_YOUR_KEY'; // get one from https://api.census.gov/data/key_signup.html
+
+// Detroit ZCTA GeoJSON (example from DetroitData / Wayne open data)
+const ZCTA_GEOJSON_URL = 'https://data-wayne.opendata.arcgis.com/api/download/v1/items/69f4a2d5a18e4507b8a9c64757ca7dcb/geojson?layers=0'; 
+// Vacant property registrations (Detroit Open Data) - use feature service or CSV export as GeoJSON
+const VACANT_FEATURES_URL = 'https://gis-detroit.opendata.arcgis.com/datasets/detroitmi::vacant-property-registrations-1.geojson'; // placeholder; use portal URL if different
+// RMS crime incidents (Detroit) - ArcGIS feature service query returning GeoJSON
+const CRIME_FEATURES_URL = 'https://data.detroitmi.gov/resource/3c6v-rcb9.geojson'; // example Socrata/GeoJSON endpoint (may require pagination)
+// -----------------------------------------------------------------------------------------
+
+let map = L.map('map').setView([42.3314, -83.0458], 11);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {attribution: '© OpenStreetMap contributors'}).addTo(map);
+
+let zctaLayer;
+let zctaGeojson; // raw
+let aggregated = {}; // keyed by ZCTA code
+
+// helper: color ramp
+function getColorForMetric(metric, val) {
+  if (val === null || val === undefined || isNaN(val)) return '#ccc';
+  if (metric === 'vacancy_pct') {
+    return val > 40 ? '#800026' :
+           val > 30 ? '#BD0026' :
+           val > 20 ? '#E31A1C' :
+           val > 10 ? '#FC4E2A' :
+           val > 5  ? '#FD8D3C' :
+           val > 2  ? '#FEB24C' :
+           '#FFEDA0';
+  } else if (metric === 'crime_rate_per10k') {
+    return val > 500 ? '#4d0026' :
+           val > 200 ? '#7a0230' :
+           val > 100 ? '#b3003b' :
+           val > 50  ? '#e34a33' :
+           val > 20  ? '#fc8d59' :
+           '#fee0b6';
+  } else if (metric === 'median_household_income') {
+    return val > 90000 ? '#0c2c84' :
+           val > 60000 ? '#225ea8' :
+           val > 40000 ? '#1d91c0' :
+           val > 25000 ? '#41b6c4' :
+           val > 15000 ? '#a1dab4' :
+           '#ffffcc';
+  } else if (metric === 'pct_bachelors') {
+    return val > 50 ? '#00441b' :
+           val > 30 ? '#006d2c' :
+           val > 20 ? '#238b45' :
+           val > 10 ? '#66c2a4' :
+           '#ccece6';
+  }
+  return '#999';
+}
+
+// style for each polygon, depends on currently selected metric
+function styleFeature(feature) {
+  const code = feature.properties.ZIPCODE || feature.properties.ZCTA5CE10 || feature.properties.ZCTA5CE || feature.properties.ZCTA || feature.properties.ZIP;
+  const data = aggregated[code] || {};
+  const metric = document.getElementById('metric').value;
+  const v = data[metric] ?? null;
+  return {
+    weight: 1,
+    opacity: 1,
+    color: '#333',
+    fillOpacity: 0.8,
+    fillColor: getColorForMetric(metric, v)
+  };
+}
+
+// popup content
+function popupContent(props) {
+  const code = props.ZIPCODE || props.ZCTA5CE10 || props.ZCTA5CE || props.ZCTA || props.ZIP;
+  const d = aggregated[code] || {};
+  return `<b>ZIP: ${code}</b><br/>
+    Vacancy %: ${d.vacancy_pct != null ? d.vacancy_pct.toFixed(1) + '%' : 'n/a'}<br/>
+    Crime rate /10k: ${d.crime_rate_per10k != null ? d.crime_rate_per10k.toFixed(1) : 'n/a'}<br/>
+    Median income: ${d.median_household_income != null ? '$' + Math.round(d.median_household_income) : 'n/a'}<br/>
+    % Bachelor+: ${d.pct_bachelors != null ? d.pct_bachelors.toFixed(1) + '%' : 'n/a'}<br/>
+    Total population (ACS): ${d.population ?? 'n/a'}`;
+}
+
+// load ZCTA polygons
+async function loadZCTAs() {
+  document.getElementById('info').innerText = 'Loading ZCTA polygons...';
+  const r = await fetch(ZCTA_GEOJSON_URL);
+  zctaGeojson = await r.json();
+  zctaLayer = L.geoJSON(zctaGeojson, {
+    style: styleFeature,
+    onEachFeature: function(feature, layer) {
+      layer.on({
+        click: function(e) {
+          layer.bindPopup(popupContent(feature.properties)).openPopup();
+        }
+      });
+    }
+  }).addTo(map);
+  document.getElementById('info').innerText = 'ZCTAs loaded.';
+}
+
+// fetch ACS data for ZCTA (median income B19013_001E, population B01003_001E, education B15003 or S1501 vars)
+// This function demonstrates pulling median income (B19013_001E) and percent bachelors (S1501_C01_006E for bachelor's and S1501_C01_007E for graduate?)
+// We'll use a simple pattern: fetch median income (B19013_001E) and total pop (B01003_001E) and education table S1501 for pct bachelors
+async function fetchACS_ZCTA() {
+  document.getElementById('info').innerText = 'Fetching ACS data (may take a few seconds)...';
+  // median household income and total pop
+  const year = '2022'; // change to latest available
+  const vars = ['B19013_001E','B01003_001E']; // median income, total pop
+  const acsUrl = `https://api.census.gov/data/${year}/acs/acs5?get=${vars.join(',')},NAME&for=zip%20code%20tabulation%20area:*&key=${CENSUS_API_KEY}`;
+  const resp = await fetch(acsUrl);
+  const json = await resp.json();
+  // first row are headers
+  const headers = json[0];
+  for (let i=1;i<json.length;i++){
+    const row = json[i];
+    const rec = {};
+    headers.forEach((h,idx)=>rec[h]=row[idx]);
+    const zcta = rec['zip code tabulation area'];
+    if (!aggregated[zcta]) aggregated[zcta] = {};
+    aggregated[zcta].median_household_income = rec['B19013_001E'] === null ? null : +rec['B19013_001E'];
+    aggregated[zcta].population = rec['B01003_001E'] === null ? null : +rec['B01003_001E'];
+  }
+
+  // education: percent bachelors or higher: we can query table S1501 or B15003 (educational attainment)
+  // For simplicity query B15003 to compute percent with bachelors+ (B15003_022E Bachelor's, 023E Masters, 024 PhD, 025 Prof)
+  const eduVars = ['B15003_001E','B15003_022E','B15003_023E','B15003_024E','B15003_025E'];
+  const eduUrl = `https://api.census.gov/data/${year}/acs/acs5?get=${eduVars.join(',')},NAME&for=zip%20code%20tabulation%20area:*&key=${CENSUS_API_KEY}`;
+  const r2 = await fetch(eduUrl);
+  const j2 = await r2.json();
+  const h2 = j2[0];
+  for (let i=1;i<j2.length;i++){
+    const row = j2[i];
+    const rec = {};
+    h2.forEach((hh,idx)=>rec[hh]=row[idx]);
+    const zcta = rec['zip code tabulation area'];
+    if (!aggregated[zcta]) aggregated[zcta] = {};
+    const total = +rec['B15003_001E'] || 0;
+    const bachelors = (+rec['B15003_022E']||0) + (+rec['B15003_023E']||0) + (+rec['B15003_024E']||0) + (+rec['B15003_025E']||0);
+    aggregated[zcta].pct_bachelors = total>0 ? (bachelors/total*100) : null;
+  }
+
+  document.getElementById('info').innerText = 'ACS data loaded.';
+}
+
+// fetch vacant properties and aggregate by ZCTA using turf.pointInPolygon
+async function fetchAndAggregateVacancy() {
+  document.getElementById('info').innerText = 'Loading vacancy data and aggregating...';
+  // NOTE: this demo attempts to fetch a geojson endpoint. For large sets you may want to paginate or fetch a pre-aggregated CSV.
+  try {
+    const r = await fetch(VACANT_FEATURES_URL);
+    const pts = await r.json(); // GeoJSON points
+    // initialize counters per zcta
+    for (const feat of zctaGeojson.features) {
+      const code = feat.properties.ZIPCODE || feat.properties.ZCTA5CE10 || feat.properties.ZCTA5CE || feat.properties.ZCTA || feat.properties.ZIP;
+      if (!aggregated[code]) aggregated[code] = {};
+      aggregated[code].vacant_count = 0;
+    }
+    // loop points and assign to polygon
+    const polys = zctaGeojson.features;
+    for (const p of pts.features) {
+      const pt = p.geometry;
+      for (const poly of polys) {
+        if (turf.booleanPointInPolygon(pt, poly.geometry)) {
+          const code = poly.properties.ZIPCODE || poly.properties.ZCTA5CE10 || poly.properties.ZCTA5CE || poly.properties.ZCTA || poly.properties.ZIP;
+          aggregated[code].vacant_count = (aggregated[code].vacant_count || 0) + 1;
+          break;
+        }
+      }
+    }
+    // compute vacancy pct per 1000 housing units if we had housing units; here assume vacancy_pct = (vacant_count / population) * 100 for demo
+    for (const code in aggregated) {
+      const pop = aggregated[code].population || 0;
+      aggregated[code].vacancy_pct = pop>0 ? (aggregated[code].vacant_count / pop * 100) : null;
+    }
+    document.getElementById('info').innerText = 'Vacancy aggregated.';
+  } catch (e) {
+    console.error(e);
+    document.getElementById('info').innerText = 'Vacancy: failed to load. Replace VACANT_FEATURES_URL with valid endpoint.';
+  }
+}
+
+// fetch crime points and aggregate to ZCTA, compute crime rate per 10k population
+async function fetchAndAggregateCrime() {
+  document.getElementById('info').innerText = 'Loading crime incidents and aggregating...';
+  try {
+    // CRIME_FEATURES_URL should return GeoJSON of incidents (or you may need to query arcgis/socrata with date filters)
+    const r = await fetch(CRIME_FEATURES_URL);
+    const pts = await r.json();
+    // init counters
+    for (const feat of zctaGeojson.features) {
+      const code = feat.properties.ZIPCODE || feat.properties.ZCTA5CE10 || feat.properties.ZCTA5CE || feat.properties.ZCTA || feat.properties.ZIP;
+      if (!aggregated[code]) aggregated[code] = {};
+      aggregated[code].crime_count = 0;
+    }
+    const polys = zctaGeojson.features;
+    for (const p of pts.features) {
+      const pt = p.geometry;
+      for (const poly of polys) {
+        if (turf.booleanPointInPolygon(pt, poly.geometry)) {
+          const code = poly.properties.ZIPCODE || poly.properties.ZCTA5CE10 || poly.properties.ZCTA5CE || poly.properties.ZCTA || poly.properties.ZIP;
+          aggregated[code].crime_count = (aggregated[code].crime_count || 0) + 1;
+          break;
+        }
+      }
+    }
+    // compute crime rate per 10k
+    for (const code in aggregated) {
+      const pop = aggregated[code].population || 0;
+      aggregated[code].crime_rate_per10k = pop>0 ? aggregated[code].crime_count / pop * 10000 : null;
+    }
+    document.getElementById('info').innerText = 'Crime aggregated.';
+  } catch (e) {
+    console.error(e);
+    document.getElementById('info').innerText = 'Crime: failed to load. Replace CRIME_FEATURES_URL with valid endpoint or paginate properly.';
+  }
+}
+
+// refresh the map styling
+function refreshMap() {
+  if (zctaLayer) {
+    zctaLayer.setStyle(styleFeature);
+  }
+}
+
+// UI wiring
+document.getElementById('metric').addEventListener('change', refreshMap);
+document.getElementById('vacancy_min').addEventListener('input', ()=> {
+  document.getElementById('vacancy_min_val').innerText = document.getElementById('vacancy_min').value + '%';
+});
+document.getElementById('crime_max').addEventListener('input', ()=> {
+  document.getElementById('crime_max_val').innerText = document.getElementById('crime_max').value;
+});
+document.getElementById('income_min').addEventListener('input', ()=> {
+  document.getElementById('income_min_val').innerText = '$' + document.getElementById('income_min').value;
+});
+
+document.getElementById('apply').addEventListener('click', ()=> {
+  // apply filters by toggling polygon opacity if out of filter range
+  const vacMin = +document.getElementById('vacancy_min').value;
+  const crimeMax = +document.getElementById('crime_max').value;
+  const incomeMin = +document.getElementById('income_min').value;
+  zctaLayer.eachLayer(layer => {
+    const props = layer.feature.properties;
+    const code = props.ZIPCODE || props.ZCTA5CE10 || props.ZCTA5CE || props.ZCTA || props.ZIP;
+    const d = aggregated[code] || {};
+    let show = true;
+    if (d.vacancy_pct != null && d.vacancy_pct < vacMin) show = false;
+    if (d.crime_rate_per10k != null && d.crime_rate_per10k > crimeMax) show = false;
+    if (d.median_household_income != null && d.median_household_income < incomeMin) show = false;
+    layer.setStyle({fillOpacity: show ? 0.85 : 0.08, opacity: show ? 1 : 0.3});
+  });
+});
+
+// orchestrator: load all data and compute joins
+async function init() {
+  await loadZCTAs();
+  await fetchACS_ZCTA();
+  await fetchAndAggregateVacancy();
+  await fetchAndAggregateCrime();
+  refreshMap();
+  document.getElementById('info').innerText = 'Ready. Click a ZIP to see details.';
+}
+
+init();
+
+</script>
+</body>
+</html>
